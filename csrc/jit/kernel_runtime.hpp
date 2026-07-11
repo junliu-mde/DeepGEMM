@@ -94,17 +94,23 @@ public:
     }
 
     static bool check_validity(const std::filesystem::path& dir_path) {
-        if (not std::filesystem::exists(dir_path))
+        // NOTES: use the non-throwing overloads and treat filesystem errors as a cache miss,
+        // so that callers fall back to the compile path instead of propagating an exception.
+        // On distributed filesystems, `status()` may transiently fail with `ESTALE` when
+        // another rank atomically renames the directory into place over a dentry that this
+        // process has already cached
+        std::error_code ec;
+        if (not std::filesystem::exists(dir_path, ec) or ec)
             return false;
 
         // NOTES: if the directory exists, `kernel.cu` and `kernel.cubin` must both exist,
-        // because the directory is created atomically via rename
-        if (not std::filesystem::exists(dir_path / "kernel.cu") or
-            not std::filesystem::exists(dir_path / "kernel.cubin")) {
-            printf("Corrupted JIT cache directory (missing kernel.cu or kernel.cubin): %s, "
-                   "please run `rm -rf %s` and restart your task.\n",
-                   dir_path.c_str(), dir_path.c_str());
-            DG_HOST_ASSERT(false and "Corrupted JIT cache directory");
+        // because the directory is created atomically via rename; an unreadable or
+        // incomplete directory is treated as a miss and will be recompiled
+        if (not std::filesystem::exists(dir_path / "kernel.cu", ec) or ec or
+            not std::filesystem::exists(dir_path / "kernel.cubin", ec) or ec) {
+            printf("Invalid or unreadable JIT cache directory: %s (%s), treating as a cache miss\n",
+                   dir_path.c_str(), ec ? ec.message().c_str() : "missing kernel.cu or kernel.cubin");
+            return false;
         }
         return true;
     }
