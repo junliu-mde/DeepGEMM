@@ -8,7 +8,6 @@
 #include <nvrtc.h>
 #include <regex>
 #include <string>
-#include <thread>
 
 #include "../utils/exception.hpp"
 #include "../utils/format.hpp"
@@ -130,45 +129,31 @@ public:
         // Fsync before rename to ensure visibility on distributed filesystems
         fsync_dir(tmp_dir_path);
 
-        // Atomically rename the temporary directory to the final cache path
-        // NOTES: if another rank already created dir_path, rename will fail — that's fine
+        // Load the freshly compiled CUBIN before publishing it. The loaded module is
+        // independent of the pathname, including when the shared cache is unreadable.
+        const auto runtime = std::make_shared<KernelRuntime>(tmp_dir_path);
+
         make_dirs(dir_path.parent_path());
         std::error_code error_code;
         std::filesystem::rename(tmp_dir_path, dir_path, error_code);
-        const auto renamed = not static_cast<bool>(error_code);
-
-        // Put into the runtime cache
-        // NOTES: on distributed filesystems the directory another rank just renamed into
-        // place may be transiently unreadable from this process (stale NFS dentry or
-        // attribute caches), so retry with backoff before giving up on the shared path
-        auto runtime = kernel_runtime_cache->get(dir_path);
-        for (int i = 0; runtime == nullptr and i < 5; ++ i) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(50 << i));
-            runtime = kernel_runtime_cache->get(dir_path);
+        if (error_code) {
+            // An incomplete entry cannot win a rename race forever. Move it aside; if
+            // another rank changed the path first, this rename simply fails.
+            if (not KernelRuntime::check_validity(dir_path)) {
+                const auto stale_dir_path = tmp_dir_path.string() + ".stale";
+                std::filesystem::rename(dir_path, stale_dir_path, error_code);
+                if (not error_code) {
+                    std::filesystem::rename(tmp_dir_path, dir_path, error_code);
+                    safe_remove_all(stale_dir_path);
+                }
+            }
         }
 
-        if (renamed) {
-            // Our rename succeeded, so the shared path is our own freshly compiled
-            // directory and must be loadable
-            DG_HOST_ASSERT(runtime != nullptr);
-            return runtime;
-        }
-
-        if (runtime == nullptr) {
-            // Last resort: load from our private temporary directory, which is always
-            // consistent for this process; kernel sharing is skipped for this instance
-            printf("Shared JIT cache directory is unreadable: %s, loading the privately "
-                   "compiled copy from %s instead\n", dir_path.c_str(), tmp_dir_path.c_str());
-            runtime = kernel_runtime_cache->get(tmp_dir_path);
-            DG_HOST_ASSERT(runtime != nullptr);
-            return runtime;
-        }
-
-        // Another rank beat us, then clean up our dir and use the existing one
-        // NOTES: avoid `std::filesystem::remove_all` here — it can segfault on
-        // distributed filesystems, when concurrent processes operate
-        // on the same parent directory, causing stale directory entries
         safe_remove_all(tmp_dir_path);
+
+        // Always use the canonical key. Caching by tmp_dir_path recompiles and retains
+        // one CUDA module on every subsequent call.
+        kernel_runtime_cache->put(dir_path, runtime);
         return runtime;
     }
 
